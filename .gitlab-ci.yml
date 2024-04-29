@@ -761,7 +761,7 @@ NIGHTLY_SUCCESS:
   script:
     - schutzbot/slack_notification.sh SUCCESS ":partymeow:" rhel
 
-NIGHTLY_GA/EUS_FAIL:
+GA/EUS_FAIL:
   stage: finish
   tags:
     - shell
@@ -771,7 +771,7 @@ NIGHTLY_GA/EUS_FAIL:
   script:
     - schutzbot/slack_notification.sh FAILED ":big-sad:" ga
 
-NIGHTLY_GA/EUS_SUCCESS:
+GA/EUS_SUCCESS:
   stage: finish
   tags:
     - shell
