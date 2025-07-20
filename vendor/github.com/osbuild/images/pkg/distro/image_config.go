@@ -46,11 +46,11 @@ type ImageConfig struct {
 	GPGKeyFiles []string `yaml:"gpgkey_files,omitempty"`
 
 	// Disable SELinux labelling
-	NoSElinux *bool `yaml:"no_selinux,omitempty"`
+	NoSELinux *bool `yaml:"no_selinux,omitempty"`
 
 	// Do not use. Forces auto-relabelling on first boot.
 	// See https://github.com/osbuild/osbuild/commit/52cb27631b587c1df177cd17625c5b473e1e85d2
-	SELinuxForceRelabel *bool `yaml:"selinux_force_relabel"`
+	SELinuxForceRelabel *bool `yaml:"selinux_force_relabel,omitempty"`
 
 	// Disable documentation
 	ExcludeDocs *bool `yaml:"exclude_docs,omitempty"`
@@ -135,24 +135,32 @@ type ImageConfig struct {
 	// instead of writing to /etc/fstab
 	MountUnits *bool `yaml:"mount_units,omitempty"`
 
-	// IsoRootfsType defines what rootfs (squashfs, erofs,ext4)
+	// ISORootfsType defines what rootfs (squashfs, erofs,ext4)
 	// is used
-	IsoRootfsType *manifest.RootfsType `yaml:"iso_rootfs_type,omitempty"`
+	ISORootfsType *manifest.RootfsType `yaml:"iso_rootfs_type,omitempty"`
+
+	// ISOBootType defines what type of bootloader is used for the iso
+	ISOBootType *manifest.ISOBootType `yaml:"iso_boot_type,omitempty"`
+
+	// VersionlockPackges uses dnf versionlock to lock a package to the version
+	// that is installed during image build, preventing it from being updated.
+	// This is only supported for distributions that use dnf4, because osbuild
+	// only has a stage for dnf4 version locking.
+	VersionlockPackages []string `yaml:"versionlock_packages,omitempty"`
 }
 
-type DNFConfig struct {
-	Options          []*osbuild.DNFConfigStageOptions
-	SetReleaseVerVar *bool `yaml:"set_release_ver_var"`
-}
+// shallowMerge creates a new struct by merging a child and a parent.
+// Only values unset in the child will be copied from the parent.
+// It is not recursive.
+//
+// Returns a pointer to a new struct instance of type T.
+func shallowMerge[T any](child *T, parent *T) *T {
+	finalConfig := *child
 
-// InheritFrom inherits unset values from the provided parent configuration and
-// returns a new structure instance, which is a result of the inheritance.
-func (c *ImageConfig) InheritFrom(parentConfig *ImageConfig) *ImageConfig {
-	finalConfig := ImageConfig(*c)
-	if parentConfig != nil {
+	if parent != nil {
 		// iterate over all struct fields and copy unset values from the parent
-		for i := 0; i < reflect.TypeOf(*c).NumField(); i++ {
-			fieldName := reflect.TypeOf(*c).Field(i).Name
+		for i := 0; i < reflect.TypeOf(*child).NumField(); i++ {
+			fieldName := reflect.TypeOf(*child).Field(i).Name
 			field := reflect.ValueOf(&finalConfig).Elem().FieldByName(fieldName)
 
 			// Only container types or pointer are supported.
@@ -163,11 +171,22 @@ func (c *ImageConfig) InheritFrom(parentConfig *ImageConfig) *ImageConfig {
 			}
 
 			if field.IsNil() {
-				field.Set(reflect.ValueOf(parentConfig).Elem().FieldByName(fieldName))
+				field.Set(reflect.ValueOf(parent).Elem().FieldByName(fieldName))
 			}
 		}
 	}
 	return &finalConfig
+}
+
+type DNFConfig struct {
+	Options          []*osbuild.DNFConfigStageOptions
+	SetReleaseVerVar *bool `yaml:"set_release_ver_var"`
+}
+
+// InheritFrom inherits unset values from the provided parent configuration and
+// returns a new structure instance, which is a result of the inheritance.
+func (c *ImageConfig) InheritFrom(parentConfig *ImageConfig) *ImageConfig {
+	return shallowMerge(c, parentConfig)
 }
 
 func (c *ImageConfig) DNFConfigOptions(osVersion string) []*osbuild.DNFConfigStageOptions {
