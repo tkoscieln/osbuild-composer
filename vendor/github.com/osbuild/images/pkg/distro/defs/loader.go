@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"text/template"
 
@@ -22,7 +23,9 @@ import (
 	"github.com/osbuild/images/pkg/disk"
 	"github.com/osbuild/images/pkg/distro"
 	"github.com/osbuild/images/pkg/experimentalflags"
+	"github.com/osbuild/images/pkg/manifest"
 	"github.com/osbuild/images/pkg/olog"
+	"github.com/osbuild/images/pkg/osbuild"
 	"github.com/osbuild/images/pkg/platform"
 	"github.com/osbuild/images/pkg/rpmmd"
 	"github.com/osbuild/images/pkg/runner"
@@ -96,6 +99,15 @@ type DistroYAML struct {
 	imageTypes map[string]ImageTypeYAML
 	// distro wide default image config
 	imageConfig *distro.ImageConfig `yaml:"default"`
+
+	// ignore the given image types
+	Conditions map[string]distroConditions `yaml:"conditions"`
+
+	// XXX: remove this in favor of a better abstraction, this
+	// is currently needed because the manifest pkg has conditionals
+	// based on the distro, ideally it would not have this but
+	// here we are.
+	DistroLike manifest.Distro `yaml:"distro_like"`
 }
 
 func (d *DistroYAML) ImageTypes() map[string]ImageTypeYAML {
@@ -107,6 +119,18 @@ func (d *DistroYAML) ImageTypes() map[string]ImageTypeYAML {
 // Each ImageType gets this as their default ImageConfig.
 func (d *DistroYAML) ImageConfig() *distro.ImageConfig {
 	return d.imageConfig
+}
+
+func (d *DistroYAML) SkipImageType(imgTypeName, archName string) bool {
+	id := common.Must(distro.ParseID(d.Name))
+
+	for _, cond := range d.Conditions {
+		if cond.When.Eval(id, archName) && slices.Contains(cond.IgnoreImageTypes, imgTypeName) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (d *DistroYAML) runTemplates(nameVer string) error {
@@ -206,6 +230,9 @@ func NewDistroYAML(nameVer string) (*DistroYAML, error) {
 		for name := range toplevel.ImageTypes {
 			v := toplevel.ImageTypes[name]
 			v.name = name
+			if err := v.runTemplates(foundDistro); err != nil {
+				return nil, err
+			}
 			foundDistro.imageTypes[name] = v
 		}
 	}
@@ -234,6 +261,7 @@ type distroImageConfig struct {
 // multiple whenConditions are considred AND
 type whenCondition struct {
 	DistroName            string `yaml:"distro_name,omitempty"`
+	NotDistroName         string `yaml:"not_distro_name,omitempty"`
 	Architecture          string `yaml:"arch,omitempty"`
 	VersionLessThan       string `yaml:"version_less_than,omitempty"`
 	VersionGreaterOrEqual string `yaml:"version_greater_or_equal,omitempty"`
@@ -245,6 +273,9 @@ func (wc *whenCondition) Eval(id *distro.ID, archStr string) bool {
 
 	if wc.DistroName != "" {
 		match = match && (wc.DistroName == id.Name)
+	}
+	if wc.NotDistroName != "" {
+		match = match && (wc.NotDistroName != id.Name)
 	}
 	if wc.Architecture != "" {
 		match = match && (wc.Architecture == archStr)
@@ -286,6 +317,11 @@ func (di *distroImageConfig) For(nameVer string) (*distro.ImageConfig, error) {
 type distroImageConfigConditions struct {
 	When         whenCondition       `yaml:"when,omitempty"`
 	ShallowMerge *distro.ImageConfig `yaml:"shallow_merge,omitempty"`
+}
+
+type distroConditions struct {
+	When             *whenCondition `yaml:"when"`
+	IgnoreImageTypes []string       `yaml:"ignore_image_types"`
 }
 
 type ImageTypeYAML struct {
@@ -338,12 +374,47 @@ type ImageTypeYAML struct {
 
 	NameAliases []string `yaml:"name_aliases"`
 
+	// for RHEL7 compat
+	// TODO: determine a better place for these options, but for now they are here
+	DiskImagePartTool     *osbuild.PartTool `yaml:"disk_image_part_tool"`
+	DiskImageVPCForceSize *bool             `yaml:"disk_image_vpc_force_size"`
+
+	SupportedPartitioningModes []disk.PartitioningMode `yaml:"supported_partitioning_modes"`
+
 	// name is set by the loader
 	name string
 }
 
 func (it *ImageTypeYAML) Name() string {
 	return it.name
+}
+
+func (it *ImageTypeYAML) runTemplates(distro *DistroYAML) error {
+	var data any
+	// set the DistroVendor in the struct only if its actually
+	// set, this ensures that the template execution fails if the
+	// template is used by the user has not set it
+	if distro.Vendor != "" {
+		data = struct {
+			DistroVendor string
+		}{
+			DistroVendor: distro.Vendor,
+		}
+	}
+	for idx := range it.Platforms {
+		// fill the UEFI vendor string
+		templ, err := template.New("uefi-vendor").Parse(it.Platforms[idx].UEFIVendor)
+		templ.Option("missingkey=error")
+		if err != nil {
+			return fmt.Errorf(`cannot parse template for "vendor" field: %w`, err)
+		}
+		var buf bytes.Buffer
+		if err := templ.Execute(&buf, data); err != nil {
+			return fmt.Errorf(`cannot execute template for "vendor" field (is it set?): %w`, err)
+		}
+		it.Platforms[idx].UEFIVendor = buf.String()
+	}
+	return nil
 }
 
 type imageConfig struct {
@@ -362,8 +433,8 @@ type installerConfig struct {
 }
 
 type conditionsInstallerConf struct {
-	When     whenCondition           `yaml:"when,omitempty"`
-	Override *distro.InstallerConfig `yaml:"override,omitempty"`
+	When         whenCondition           `yaml:"when,omitempty"`
+	ShallowMerge *distro.InstallerConfig `yaml:"shallow_merge,omitempty"`
 }
 
 type packageSet struct {
@@ -502,7 +573,7 @@ func (imgType *ImageTypeYAML) InstallerConfig(distroNameVer, archName string) (*
 
 		for _, cond := range condMap {
 			if cond.When.Eval(id, archName) {
-				installerConfig = cond.Override
+				installerConfig = cond.ShallowMerge.InheritFrom(installerConfig)
 			}
 		}
 	}

@@ -159,19 +159,8 @@ func (t *imageType) getPartitionTable(customizations *blueprint.Customizations, 
 		return disk.NewCustomPartitionTable(partitioning, partOptions, rng)
 	}
 
-	partitioningMode := options.PartitioningMode
-	if t.ImageTypeYAML.RPMOSTree {
-		// IoT supports only LVM, force it.
-		// Raw is not supported, return an error if it is requested
-		// TODO Need a central location for logic like this
-		if partitioningMode == disk.RawPartitioningMode {
-			return nil, fmt.Errorf("partitioning mode raw not supported for %s on %s", t.Name(), t.arch.Name())
-		}
-		partitioningMode = disk.AutoLVMPartitioningMode
-	}
-
 	mountpoints := customizations.GetFilesystems()
-	return disk.NewPartitionTable(basePartitionTable, mountpoints, imageSize, partitioningMode, t.platform.GetArch(), t.ImageTypeYAML.RequiredPartitionSizes, rng)
+	return disk.NewPartitionTable(basePartitionTable, mountpoints, imageSize, options.PartitioningMode, t.platform.GetArch(), t.ImageTypeYAML.RequiredPartitionSizes, rng)
 }
 
 func (t *imageType) getDefaultImageConfig() *distro.ImageConfig {
@@ -303,7 +292,13 @@ func (t *imageType) Manifest(bp *blueprint.Blueprint,
 		return nil, nil, err
 	}
 	mf := manifest.New()
-	mf.Distro = manifest.DISTRO_FEDORA
+	// TODO: remove the need for this entirely, the manifest has a
+	// bunch of code that checks the distro currently, ideally all
+	// would just be encoded in the YAML
+	mf.Distro = t.arch.distro.DistroYAML.DistroLike
+	if mf.Distro == manifest.DISTRO_NULL {
+		return nil, nil, fmt.Errorf("no distro_like set in yaml for %q", t.arch.distro.Name())
+	}
 	if options.UseBootstrapContainer {
 		mf.DistroBootstrapRef = bootstrapContainerFor(t)
 	}
@@ -324,6 +319,10 @@ func (t *imageType) checkOptions(bp *blueprint.Blueprint, options distro.ImageOp
 
 	if !t.ImageTypeYAML.RPMOSTree && options.OSTree != nil {
 		return warnings, fmt.Errorf("OSTree is not supported for %q", t.Name())
+	}
+
+	if len(t.ImageTypeYAML.SupportedPartitioningModes) > 0 && !slices.Contains(t.ImageTypeYAML.SupportedPartitioningModes, options.PartitioningMode) {
+		return warnings, fmt.Errorf("partitioning mode %s not supported for %q on %q", options.PartitioningMode, t.Name(), t.arch.distro.Name())
 	}
 
 	// we do not support embedding containers on ostree-derived images, only on commits themselves
@@ -489,7 +488,7 @@ func (t *imageType) checkOptions(bp *blueprint.Blueprint, options distro.ImageOp
 	}
 	if instCust != nil {
 		// only supported by the Anaconda installer
-		if slices.Index([]string{"iot-installer"}, t.Name()) == -1 {
+		if !slices.Contains([]string{"image-installer", "edge-installer", "live-installer", "iot-installer"}, t.Name()) {
 			return warnings, fmt.Errorf("installer customizations are not supported for %q", t.Name())
 		}
 
